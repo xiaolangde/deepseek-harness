@@ -74,7 +74,7 @@
 
 **为什么**：
 
-1. **执行环境可切换**：本地 → 远程沙箱 → E2B，只需要换 provider 配置。
+1. **执行环境可切换**：本地 → 沙箱强制 → SSH 远端，只需要换 provider 配置。
 2. **实现可替换**：测试时用 mock provider；生产用真实 provider。
 3. **消费者不耦合实现**：工具代码只依赖 `ctx.fs` 接口，不知道背后是哪个 provider。
 
@@ -105,7 +105,7 @@
 **dsh 实例**：
 
 - 事件日志只追加：`user/message`、`assistant/message`、`tool/result` 都是 append
-- Surface 事件带 `surfaceOp`：`'append'` 或 `{op:'replace', start, end}`
+- Surface 事件带 `surfaceOp`：`'append'` 或 `{op:'replace', startSeq, endSeq}`
 - 压缩（compaction）产生 replace 操作：把前 20 条消息替换成一条摘要
 - 日志本身不改——replace 是投影层概念
 
@@ -143,7 +143,7 @@
 
 - Loader 失败 → stderr 标注具体行 + exit(1)
 - bundle 声明缺失 → fail-loud（不静默跳过）
-- `SESSION_FORMAT_VERSION` 不匹配 → 拒绝加载（不迁移）
+- 未来版本的会话日志 → 拒绝加载；历史版本 → 相邻迁移链解码，已提交代际不可变
 - profile 引用不存在的 entry id → stderr 警告
 
 **为什么**：

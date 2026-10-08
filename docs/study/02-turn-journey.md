@@ -40,36 +40,38 @@ turn 开始
 │ (Web/   │                  │  Handle   │                │  (事件日志)   │
 │  CLI)   │                  └───────────┘                └──────────────┘
 └────┬────┘                       │                              │
-     │ agent/* events              │ wake driver                  │ session/event
-     │ (live, 非持久)               ▼                              │ (durable, 持久)
-     │                   ┌──────────────────────┐                  │
-     │                   │   Agent Loop (driver)│                  │
-     │                   │                      │                  │
-     │                   │  1. claim inbox      │                  │
-     │                   │     → turn/start     │──────────────────┘
-     │                   │  2. agent/pre-step   │
-     │                   │     (waterfall)      │
-     │                   │  3. step/start       │──────────────────┐
-     │                   │     + user/message   │                  │
-     │                   │  4. 组装 prompt      │                  │
-     │                   │     + tool schemas   │                  │
-     │                   │  5. agent/request    │                  │
-     │                   │     (waterfall)      │                  │
-     │                   │  6. llm/stream       │                  │
-     │                   │     (waterfall)      │                  │
-     │                   │  7. 流式持久化        │                  │
-     │                   │     assistant/chunk* │──────────────────┤
-     │                   │  8. assistant/message│                  │
-     │                   │  9. 工具调用          │                  │
-     │                   │     tool/call*       │──────────────────┤
-     │                   │     tools/pre-execute│                  │
-     │                   │     tools/execute    │                  │
-     │                   │     tools/post-execute│                 │
-     │                   │     tool/result*     │──────────────────┤
-     │                   │ 10. step/end         │                  │
-     │                   │ 11. agent/turn-stopping│                │
+     │ agent/* events             │ wake driver                  │ session/event
+     │ (live, 非持久)              ▼                              │ (durable, 持久)
+     │                   ┌──────────────────────┐                 │
+     │                   │   Agent Loop (driver)│                 │
+     │                   │                      │                 │
+     │                   │  1. claim inbox      │                 │
+     │                   │     → turn/start     │─────────────────┘
+     │                   │  2. agent/pre-step   │                 │
+     │                   │     (waterfall)      │                 │
+     │                   │  3. step/start       │─────────────────┐
+     │                   │  4. agent/request    │                 │
+     │                   │     (waterfall)      │                 │
+     │                   │     + prepareCall()  │                 │
+     │                   │  5. system/message   │─────────────────┤
+     │                   │     + user/message   │                 │
+     │                   │     + request/header │─────────────────┤
+     │                   │  6. 派生并冻结历史    │                 │
+     │                   │  7. llm/stream       │                 │
+     │                   │     (waterfall)      │                 │
+     │                   │     → agent/assistant-stream (live 帧)  │
+     │                   │  8. assistant/message │────────────────┤
+     │                   │     (或 assistant/attempt)              │
+     │                   │  9. 工具调用          │                 │
+     │                   │     tool/call*       │─────────────────┤
+     │                   │     tools/pre-execute│                 │
+     │                   │     tools/execute    │                 │
+     │                   │     tools/post-execute│                │
+     │                   │     tool/result*     │─────────────────┤
+     │                   │ 10. step/end         │─────────────────┤
+     │                   │ 11. agent/turn-stopping│               │
      │                   │ 12. 若需继续 → goto 1 │                 │
-     │                   │ 13. turn/end         │──────────────────┘
+     │                   │ 13. turn/end         │─────────────────┘
      │                   └──────────────────────┘
      │
      ◀── agent/status (idle/running) + session/event (durable) ──┘
@@ -77,7 +79,7 @@ turn 开始
 
 **几个关键设计选择**，会在后续章节展开：
 
-- **durable 事件 vs live 事件**：`turn/*`、`step/*`、`user/message`、`assistant/*`、`tool/*` 是 durable 事件（写入会话日志）；`agent/*`、`tools/*`、`llm/stream` 是 live 事件（只用于实时控制/拦截，不持久化）。
+- **durable 事件 vs live 事件**：`turn/*`、`step/*`、`system/message`、`user/message`、`assistant/message`、`assistant/attempt`、`tool/*` 是 durable 事件（写入会话日志）；`agent/*`、`tools/*`、`llm/stream` 是 live 事件（只用于实时控制/拦截，不持久化）。UI 的实时流式增量来自 live 的 `agent/assistant-stream` 帧；durable 日志只保留结算结果。
 - **inbox 是 durable 投影**：用户输入先进入 agent 的 inbox（两个有序列表：`next-turn` 和 `next-step`），驱动器在 step boundary claim 它们。
 - **pre-step 是 waterfall**：它决定模型看到什么——可以 reject（不开 step）、可以改写消息、可以原样通过。
 - **工具先记录、后执行**：`tool/call` 在执行前就写入日志，这样即使执行中崩溃，恢复时知道有过这次调用。
@@ -95,6 +97,9 @@ turn 开始
 | `inject(msg)` | `next-step` | 否 | 为下一个 pre-step 排模型可见上下文，不唤醒；运行中的驱动器在最近的 step boundary 消费 |
 
 ```ts
+import type { UserMessage } from '@deepseek-ai/dsh-llm'
+import type { InboxTarget } from '@deepseek-ai/dsh-agent'
+
 // packages/core/agent/src/types.ts （概念精简）
 interface Agent {
   /** 路由输入到 inbox boundary 并可选唤醒驱动器 */
@@ -131,39 +136,53 @@ Inbox
 4. **`agent/pre-step` waterfall**：把 claimed 消息交给 pre-step 监听器。
 
 ```ts
+import type { UserMessage } from '@deepseek-ai/dsh-llm'
+
 // pre-step 的决策类型
 type PreStepDecision =
   | { kind: 'reject' }                      // 拒绝：不开 step
-  | { kind: 'enter'; messages: UserMessage[] }  // 进入：用这些消息（可改写）
+  | {
+      kind: 'enter'                         // 进入：用这些消息（可改写）
+      messages: UserMessage[]
+      startsRequestSeries?: true            // 声明开启一个新的模型消息系列
+    }
 ```
 
 **pre-step 是唯一的串行 listener chain**——在请求派发之前运行。Hook 桥（如 Claude Code hooks）在这里做决策：拒绝危险操作、改写消息内容、注入额外上下文。
 
-**如果 reject**：已 claim 的消息保持移除状态（不回 inbox），turn 无 step 关闭，日志记录这次尝试。这意味着"用户发了消息但被 hook 拒绝"是一个 durable 事实。
+**如果 reject**：已 claim 的消息保持移除状态（不回 inbox），turn 无 step 关闭，日志记录这次尝试。这意味着"用户发了消息但被 hook 拒绝"是一个 durable 事实。首个 enter 被改写成空消息同样关闭 turn。
 
 ## 2.5 阶段三：step 执行 —— 从请求到回答
 
 pre-step 返回 `enter` 后，驱动器进入一个 step：
 
 1. **`step/start`**：在日志上开启新 step。
-2. **`user/message`**：把 entered 的消息逐条写入日志（成为 model-visible history）。
-3. **组装 prompt**：`ctx.systemPrompt.assemble()` waterfall 组装提示词段落 + 工具 schema。
-4. **`agent/request` waterfall**：冻结调用配置（provider、model、maxTokens 等）。
-5. **`llm/stream` waterfall**：调用 LLM 适配器，返回 `StreamChunk` 流。
-6. **流式持久化**：每个 `StreamChunk` 写入 `assistant/chunk` 事件（token 级重放保真）。
-7. **`assistant/message`**：流结束后，组装完整的 `AssistantMessage` 写入日志（派生历史用此事件）。
+2. **组装 prompt**：`ctx.systemPrompt.assemble()` waterfall 组装提示词段落 + 工具 schema。
+3. **`agent/request` waterfall + `prepareCall()`**：确定 provider/model/重试策略，把调用配置解析并冻结成 prepared call。这两个异步阶段被取消时，system 与 user 消息都不落日志。
+4. **`system/message`**：用 prepared call 的能力对账系统提示——渲染后的提示词是 surface 节点 0；有能力增量的路由可以在缓存历史之后追加非空更新。
+5. **`user/message`**：仅在 step 的第一次尝试时，把 entered 的消息逐条写入日志（成为 model-visible history）。
+6. **`request/header` / `request/context`**：需要时记录调用配置快照与路由元数据。
+7. **派生并冻结历史**：`deriveMessages()` 从日志派生模型历史，请求一旦派出不再变化。
+8. **`llm/stream` waterfall**：调用 LLM 适配器，返回 `StreamChunk` 流；每个流块同时以 `agent/assistant-stream` live 帧（start / chunk* / end）发布给 UI。
+9. **durable 结算**：流结束后写入 `assistant/message`（组装好的完整消息 + 内嵌精确计时流记录 `stream`）；如果这次尝试没有产生任何模型可见消息（失败、被重试、被取消），写入 log-only 的 `assistant/attempt`。
 
 ```
 step/start
-  │
-  ├── user/message (每条 entered 消息)
   │
   ├── systemPrompt.assemble()
   │     ├── 提示词段落 (persona, harness:source, 工作区指令, ...)
   │     └── 工具 schema (所有注册工具的 JSON Schema)
   │
-  ├── agent/request (waterfall)
-  │     └── 冻结 LlmCallConfig { provider, model, maxTokens, ... }
+  ├── agent/request (waterfall) + prepareCall()
+  │     └── 冻结 LlmCallConfig { provider, model, maxTokens, ... } + 重试策略
+  │
+  ├── system/message (surface 节点 0；有能力路由可增量追加)
+  │
+  ├── user/message (每条 entered 消息，仅第一次尝试)
+  │
+  ├── request/header + request/context (按需记录)
+  │
+  ├── deriveMessages() → 冻结的模型历史
   │
   ├── llm/stream (waterfall)
   │     └── StreamChunk*
@@ -172,16 +191,17 @@ step/start
   │           ├── block-end
   │           ├── usage
   │           └── finish { reason, replayState? }
+  │     └── agent/assistant-stream (live 帧: start / chunk* / end)
   │
-  ├── assistant/chunk* (持久化每个 chunk)
-  │
-  └── assistant/message (持久化完整消息 + usage)
+  └── assistant/message (内嵌 stream 记录 + usage)
+      或 assistant/attempt (未产生模型可见消息的尝试)
 ```
 
 **关键点**：
 
-- **请求配置从日志 header 重建**，不是每次调用重新构建。`request/header` 事件记录了 call config + 适配器默认 + 渲染提示 + 工具 schema，使请求可从会话日志完整重建。
-- **`assistant/chunk` 保原始流块**，`assistant/message` 保组装后的消息。派生历史（`deriveMessages()`）用 `assistant/message`；UI 重放用 `assistant/chunk`。
+- **请求配置从日志 header 重建**，不是每次调用重新构建。`request/header` 事件记录了 call config + 适配器默认标记 + 渲染提示 + 工具 schema，使请求可从会话日志完整重建。
+- **`assistant/message` 内嵌流记录**：`stream: AssistantStreamRecord[]` 保存产生这条消息的精确计时流（压缩过，但不合并 delta 边界），UI 重放与调试都从这里来；实时增量则走 live 的 `agent/assistant-stream`。
+- **重试不重复组装**：同一次尝试序列里，重试不重跑 prompt 组装，也不重跑 `agent/pre-step`。
 - **空内容也记录 `assistant/message`**——为了保存 usage 和 provider/model 信息，但不进派生历史。
 
 ## 2.6 阶段四：工具调用的 settlement
@@ -224,7 +244,7 @@ LLM 输出 tool-call 块
 
 循环根据 `isConcurrencySafe(args)` 分类工具，形成屏障与滚动池。
 
-**工具结果如何回到模型**：`tool/result` 事件写入日志后，下一个 step 的 `deriveMessages()` 会把它投影为带 `tool-result` 块的 user-role 消息。模型在下一个 step 看到工具结果，决定是否继续调用工具。
+**工具结果如何回到模型**：`tool/result` 事件写入日志后，下一个 step 的 `deriveMessages()` 会把它投影为一条 **tool-role 消息**（`ToolResultMessage`，带 `toolCallId`）。模型在下一个 step 看到工具结果，决定是否继续调用工具。
 
 ## 2.7 阶段五：turn 结束
 
@@ -280,16 +300,20 @@ agent/pre-step (waterfall)
         ▼
 step/start ──► Session 日志
    │
-   ├── user/message* ──► Session 日志
-   │
    ├── systemPrompt.assemble()
-   ├── agent/request (waterfall)
+   ├── agent/request (waterfall) + prepareCall()
+   │
+   ├── system/message ──► Session 日志 (surface 节点 0)
+   ├── user/message* ──► Session 日志
+   ├── request/header ──► Session 日志 (按需)
+   │
    ├── llm/stream (waterfall)
    │      │
-   │      └── StreamChunk* → assistant/chunk* ──► Session 日志
-   │                                    → session/event → UI/SDK
+   │      ├── agent/assistant-stream (live 帧: start/chunk*/end) → UI/SDK
+   │      └── StreamChunk*
    │
-   ├── assistant/message ──► Session 日志
+   ├── assistant/message (内嵌 stream) ──► Session 日志
+   │   或 assistant/attempt (log-only)
    │
    ├── tool/call* ──► Session 日志 (先记录)
    │
@@ -331,14 +355,16 @@ T+3ms     turn/start                    日志记录 turn 开始
 T+4ms     agent/inbox/claimed           claim 消息
 T+5ms     agent/pre-step → enter        pre-step 通过
 T+6ms     step/start                    日志记录 step 1 开始
-T+7ms     user/message                  用户消息写入日志
-T+10ms    systemPrompt.assemble         组装提示词 + 工具 schema
-T+12ms    agent/request                 冻结调用配置
+T+8ms     systemPrompt.assemble         组装提示词 + 工具 schema
+T+10ms    agent/request + prepareCall   冻结调用配置，锁定路由
+T+11ms    system/message                渲染的系统提示写入日志（节点 0）
+T+12ms    user/message                  用户消息写入日志
+T+13ms    request/header                记录调用配置快照
 T+15ms    llm/stream                    ← 唯一一次 LLM 调用
-T+100ms     → assistant/chunk (text)    流式输出文本
-T+200ms     → assistant/chunk (text)    ...
-T+300ms     → assistant/chunk (tool-call)  模型决定读文件
-T+301ms    assistant/message            完整消息写入日志
+T+16ms      → agent/assistant-stream    live 帧 start
+T+100ms     → agent/assistant-stream    live 帧 chunk (text)
+T+300ms     → agent/assistant-stream    live 帧 chunk (tool-call)
+T+301ms    assistant/message            完整消息 + 内嵌流记录写入日志
 T+302ms    tool/call (read, ...)        先记录工具调用
 T+310ms    tools/pre-execute → allow    权限检查通过
 T+320ms    tools/execute                执行 read
@@ -349,7 +375,7 @@ T+333ms    claim → pre-step → enter     下一个 step
 T+334ms    step/start                   step 2 开始
 T+340ms    deriveMessages()             从日志重新派生历史（含工具结果）
 T+345ms    llm/stream                   ← 第二次 LLM 调用
-T+500ms      → assistant/chunk (text)   模型基于文件内容总结
+T+500ms      → agent/assistant-stream   live 帧 chunk (text)
 T+800ms      → finish                   模型回答完毕
 T+801ms    assistant/message            完整消息写入日志
 T+802ms    step/end                     step 2 结束
@@ -371,5 +397,6 @@ T+806ms    agent/status: idle           回到空闲
 - 为什么 `agent/pre-step` reject 后不把消息放回 inbox？（提示：durable 事实 + 避免无限循环）
 - `steer` 和 `inject` 都是 `next-step` target，区别只在是否唤醒——为什么这个区别重要？（提示：inject 是"顺便带上"，steer 是"现在就处理"）
 - 工具的"先记录、后执行"如何帮助崩溃恢复？（提示：恢复时看到 tool/call 但没有 tool/result，知道执行被中断）
+- `prepareCall()` 之后、`system/message` 之前取消，为什么两条消息都不落日志？（提示：cancellation commits neither system nor users）
 
 下一篇 → [03 · 会话日志与事件溯源](./03-session-log.md)

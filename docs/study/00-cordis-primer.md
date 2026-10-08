@@ -16,11 +16,13 @@ Cordis 是一个**插件组合框架**。它的核心思想是：
 
 ## 0.2 Service 与 Context —— 你会看到最多的模式
 
-```ts
+```ts ignore-check
 // 一个插件声明自己提供什么服务
 export class MyService extends Service {
-  constructor(ctx: Context, config: Config) {
-    super(ctx, config)
+  static Config = z.object({ maxLength: z.number() })  // 配置校验器（schemastery）
+
+  constructor(ctx: Context, public config: Config) {
+    super(ctx, 'myService')  // 注册为 ctx.myService；插件卸载时自动注销
     // 通过 ctx 注册自己的能力
   }
 }
@@ -34,19 +36,20 @@ const sessions = ctx.sessions  // 会话存储
 **要点**：
 
 - `Context` 是一个**服务仓库**（proxy 对象）。插件通过 `ctx.<key>` 访问服务，如 `ctx.tools`、`ctx.llm`。
-- `Service` 是插件的基类。它的构造函数接收 `ctx` 和 `config`，在构造时注册自己的能力。
+- `Service` 是插件的基类。子类构造函数接收 `ctx` 和校验过的 `config`，用 `super(ctx, name)` 把自己注册为 `ctx.<name>`。
+- 轻插件也可以不用类：`export function apply(ctx: Context, config: Config): void`（如 [packages/todo/tool-todo](../../packages/todo/tool-todo/src/index.ts)）。
 - 服务之间**通过 key 发现，不通过 import 导入**。这实现了"可替换"——只要 key 一样，换一个实现就行。
 
 **你在 dsh 里会看到**：几乎每个 `packages/` 下的包都定义一个 Service，注册到 `ctx` 上。
 
 ## 0.3 `inject` —— 声明服务依赖
 
-```ts
+```ts ignore-check
 export class ToolRuntime extends Service {
-  static inject = ['tools', 'llm'] as const  // 声明依赖
+  static inject = ['tools', 'llm']  // 声明依赖
 
   constructor(ctx: Context) {
-    super(ctx)
+    super(ctx, 'toolRuntime')
     // 此时 ctx.tools 和 ctx.llm 已经存在
     // 因为 Cordis 等待依赖就绪后才挂载这个插件
   }
@@ -81,7 +84,7 @@ Cordis 提供四种事件派发模式，每种有不同的语义：
 
 **事件通过 declaration merging 声明**：
 
-```ts
+```ts ignore-check
 // 在某个 Service 的类型文件里声明
 declare module '@deepseek-ai/cordis' {
   interface Events {
@@ -103,7 +106,7 @@ ctx.on('tools/execute', (payload) => {
 
 **你在 dsh 里会看到**：
 
-```ts
+```ts ignore-check
 // waterfall 模式：拦截 + 委托
 ctx.on('agent/pre-step', (payload, next) => {
   // 可以修改 payload
@@ -118,7 +121,7 @@ ctx.emit('agent/status', { agent, status: 'running' })
 
 ## 0.5 `ctx.effect()` —— 可逆的注册
 
-```ts
+```ts ignore-check
 // 注册一个工具，返回 disposer
 const dispose = ctx.effect(() => {
   ctx.tools.register(myTool)
@@ -139,7 +142,7 @@ const dispose = ctx.effect(() => {
 
 ## 0.6 Scope —— 作用域隔离
 
-```ts
+```ts ignore-check
 // 创建一个子上下文，隔离某个服务
 const childCtx = ctx.isolate('tools')
 
@@ -159,7 +162,7 @@ const childCtx = ctx.extend({ agentId: 'my-agent' })
 
 插件可以通过 Cordis 配置系统接收参数：
 
-```ts
+```ts ignore-check
 // cordis.yml 里的配置行
 - name: dsh-llm-deepseek
   config:
@@ -182,7 +185,7 @@ const childCtx = ctx.extend({ agentId: 'my-agent' })
 
 ## 0.8 一个完整的插件示例
 
-```ts
+```ts ignore-check
 import { Service, Context } from '@deepseek-ai/cordis'
 
 interface Config {
@@ -190,10 +193,10 @@ interface Config {
 }
 
 export class MyPlugin extends Service {
-  static inject = ['tools'] as const
+  static inject = ['tools']
 
   constructor(ctx: Context, config: Config) {
-    super(ctx)
+    super(ctx, 'myPlugin')
 
     // 注册一个工具（可逆 effect）
     ctx.effect(() => {

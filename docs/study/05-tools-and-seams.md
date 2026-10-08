@@ -10,13 +10,16 @@ dsh 的工具系统不是一个简单的"函数注册表"，而是一个有权�
 
 每个注册到 `ctx.tools` 的工具是一个 `ToolDefinition`。它扩展了 `ToolSchema`（name / description / parameters）并加上执行逻辑和输出声明。
 
-```ts
+```ts ignore-check
 interface ToolDefinition extends ToolSchema {
-  // 强制规范输出声明
-  output: ToolOutputDefinition
+  // 强制规范输出声明：schema + render(+ presentationMeta)
+  readonly output: ToolOutputDefinition
 
   // 执行函数：返回 lossless-JSON 值
   execute(args: unknown, exec: ToolRunContext): Promise<unknown>
+
+  // 在 post-execute 策略之前安装执行预备内容（可选）
+  projectContent?(exec, result): ContentBlock[] | undefined
 
   // 最后一英里内容变换（对每个结果调用一次，必须 total）
   finalizeContent?(exec, result): ContentBlock[] | undefined
@@ -29,22 +32,22 @@ interface ToolDefinition extends ToolSchema {
 
   // UI 呈现（纯函数，无副作用）
   presentCall?(args): ToolCallView | undefined
-  presentResult?(args, result): ToolResultView | undefined
+  presentResult?(args, result: ToolResult): ToolResultView | undefined
 }
 ```
 
 **关键设计**：
 
 - **`execute` 返回 `unknown`**——一个 lossless-JSON 值。工具自己负责验证参数（`args` 是冻结的 `unknown`，工具自校验）。
-- **`output` 是强制的**——每个工具必须声明输出的 JSON Schema 和 render 函数。这保证了输出是类型安全的、可验证的。
+- **`output` 是强制的**——每个工具必须声明输出的 JSON Schema（`schema`）和纯投影 `render(args, value)`；`presentationMeta` 可选地把可重放的呈现元数据随结果持久化。
 - **`finalizeContent` 必须 total**（不抛异常）——它是对每个结果（含管线失败）调用的最后一道内容变换。
 - **`presentCall` / `presentResult` 是纯函数**——UI 和日志重放共用同一份呈现逻辑，不会因为渲染而产生副作用。
 
 ## 5.2 defineTool DSL —— 类型安全的工具定义
 
-dsh 提供了一个 `defineTool` DSL，让工具定义类型安全且简洁：
+dsh 提供了一个 `defineTool` DSL（[packages/core/tools/src/schema.ts](../../packages/core/tools/src/schema.ts)），让工具定义类型安全且简洁：
 
-```ts
+```ts ignore-check
 const myTool = defineTool({
   name: 'read_file',
   description: 'Read a file',
@@ -128,7 +131,7 @@ tool/call (持久化：先记录，后执行)
 | `parallel` | 可与兄弟工具重叠执行 | `read`、`glob`、`grep` |
 | `exclusive` | 独占屏障，必须等前一个完成 | `write`、`edit`、`bash` |
 
-循环根据执行模式形成**屏障与滚动池**：
+没有声明 `isConcurrencySafe` 的工具默认 `exclusive`。循环根据执行模式形成**屏障与滚动池**：
 
 ```
 模型一次输出 4 个工具调用:
@@ -148,28 +151,34 @@ tool/call (持久化：先记录，后执行)
 ## 5.5 ToolExecutionResult —— 执行结果
 
 ```ts
-type ToolExecutionResult =
-  | ToolExecutionSuccess
-  | ToolExecutionFailure
+import type { ContentBlock, UserMessage } from '@deepseek-ai/dsh-llm'
+import type { JsonValue } from '@deepseek-ai/dsh-util-values'
+import type { ToolFailure } from '@deepseek-ai/dsh-tools'
 
 interface ToolExecutionSuccess {
-  value: unknown             // 规范 lossless-JSON 值（循环不持久化）
+  isError: false
+  value: JsonValue           // 执行本地规范值（循环不持久化）
   content: ContentBlock[]    // 面向模型的内容
-  meta?: JsonValue           // 额外元数据
+  meta?: JsonValue           // 工具私有的呈现元数据（随 tool/result 持久化）
   additionalContexts?: UserMessage[]  // 注入额外上下文
-  concludesTurn?: boolean    // 标记成功结果终止当前 turn
+  concludesTurn?: true       // 标记成功结果终止当前 turn
 }
 
 interface ToolExecutionFailure {
-  error: ToolFailure          // 结构化错误
+  isError: true
+  error: ToolFailure         // 结构化错误
+  content: ContentBlock[]    // 面向模型的失败内容
+  meta?: JsonValue
+  additionalContexts?: UserMessage[]
 }
 ```
 
 **关键设计**：
 
 - **`value` 是执行本地的**——循环只持久化 `content` / `error` / `meta`。`value` 不进日志。
-- **`concludesTurn`** 是一种数据驱动的 turn 终止——工具结果可以标记"这个 turn 该结束了"，不需要等 `agent/turn-stopping`。
+- **`concludesTurn`** 是一种数据驱动的 turn 终止——工具结果可以标记"这个 turn 该结束了"，不需要等 `agent/turn-stopping`。只存在于成功结果上。
 - **`additionalContexts`** 在记录的工具结果后作为 `user/message` 注入——同 step 的额外上下文 FIFO 排序。
+- **`meta` 必须 JSON 可序列化**——`Session.append` 用 `isJsonValue` 运行时校验所有事件数据；产出工具在 `presentResult` 里读回自己的 `meta`，durable 日志因此能在重放时重建同一张 UI 卡片。
 
 ## 5.6 能力 Seam —— 三角色模式
 
@@ -189,7 +198,7 @@ dsh 的每个可交换能力都是一个 **seam**，包含三个角色：
 │ (实现)    │  │ (使用者)  │
 │ fs-local │  │ tool-fs   │
 │ fs-sandbox│ │ (read/    │
-│          │  │  write/   │
+│ fs-ssh   │  │  write/   │
 │          │  │  edit)    │
 └─────────┘  └──────────┘
 ```
@@ -200,25 +209,27 @@ dsh 的每个可交换能力都是一个 **seam**，包含三个角色：
 - **Provider** 是具体实现——可以有多个，通过配置选择。换一个 provider 就改变执行环境。
 - **Consumer** 是使用者——通常是模型工具，通过 `ctx.<key>` 调用能力。它不知道背后是哪个 provider。
 
-**核心效果**：文件系统（`ctx.fs`）和子进程（`ctx.subprocess`）provider 共享一个执行世界。所以把它们指向远程沙箱（如 E2B）时，Bash、终端、LSP 都跟着走——不需要为每个工具写 provider 分支。
+**核心效果**：文件系统（`ctx.fs`）、子进程（`ctx.subprocess`）、沙箱（`ctx.sandbox`）provider 共享一个执行世界。把它们指向 SSH 远端（`fs-ssh` / `subprocess-ssh` / `sandbox-ssh`）时，Bash、终端、LSP 都跟着走——不需要为每个工具写 provider 分支。
 
 ## 5.7 现有能力 Seam 一览
 
-| Seam | ctx key | Service Definition | Providers | Consumer |
+| Seam | ctx key | Service Definition | Providers（示例） | Consumer |
 |---|---|---|---|---|
-| 文件系统 | `ctx.fs` | `dsh-fs` | `fs-local` / `fs-sandbox` / `fs-e2b` | `tool-fs` |
-| 子进程 | `ctx.subprocess` | `dsh-subprocess` | `subprocess-local` / `subprocess-e2b` | `tool-bash` |
-| Shell | `ctx.shell` | `dsh-shell` | `bash-local` / `bash-sandbox` / `pwsh-local` | `tool-bash` |
+| 文件系统 | `ctx.fs` | `dsh-fs` | `fs-local` / `fs-sandbox` / `fs-ssh` | `tool-fs`、`tool-fs-search` |
+| 子进程 | `ctx.subprocess` | `dsh-subprocess` | `subprocess-local` / `subprocess-ssh` | `tool-bash` |
+| Shell | `ctx.shell` | `dsh-shell` | `bash-local` / `bash-sandbox` / `pwsh-local` | `tool-bash`、`tool-pwsh` |
 | 终端 | `ctx.terminals` | `dsh-terminal` | `terminal-bash` | `tool-terminal` |
-| 沙箱 | `ctx.sandbox` | `dsh-sandbox` | `sandbox-local` | — |
+| 沙箱 | `ctx.sandbox` | `dsh-sandbox` | `sandbox-local` / `sandbox-windows-acl` / `sandbox-ssh` | 进程 spawn 前的 argv 包装 |
 | LSP | `ctx.lsp` | `dsh-lsp` | `lsp-stdio` | `tool-lsp` |
-| Web | `ctx.web` | `dsh-web` | `web-search-exa` / `web-fetch-http` / ... | `tool-web` |
-| 子代理 | `ctx.subagents` | `dsh-subagent` | spawn-in-process / fork / acp / codex / claude-code | `tool-subagent` |
-| 代码运行 | `ctx.codeRuntime` | `dsh-code-runtime` | `code-runtime-worker-thread` | — |
-| 压缩 | `ctx.compaction` | `dsh-compaction` | `compaction-basic` | — |
-| 持久化 | `ctx.sessionPersistence` | `dsh-session-persistence` | `jsonl` / `sqlite` | — |
-| 设置 | `ctx.settings` | `dsh-settings` | `settings-file` | — |
-| 凭证 | `ctx.credentials` | `dsh-credentials` | `credentials-local` | — |
+| Web | `ctx.web` | `dsh-web` | `web-search-deepseek` / `web-search-exa` / `web-fetch-http` | `tool-web` |
+| 子代理 | `ctx.subagents` | `dsh-subagent` | spawn / fork-in-process / acp / codex / claude-code / dsh-sdk | `tool-subagent` |
+| 工作流 | `ctx.workflowEngine` | `dsh-workflow` | `workflow-ptc` | `tool-workflow`、`tool-ralph` |
+| PTC 运行时 | `ctx.ptcRuntime` | `dsh-ptc-runtime` | `ptc-runtime-node` | `run_code` 传输（见 §5.10） |
+| 压缩 | `ctx.compaction` | `dsh-compaction` | `compaction-basic` / `compaction-image-offload` | `command-compact` |
+| 持久化 | `ctx.sessionPersistence` | `dsh-session-persistence` | `session-persistence-jsonl` | 句柄消费者（loop / 恢复） |
+| 设置 | `ctx.settings` | `dsh-settings` | 表单直接写 profile patch | Web 设置卡片 |
+| 凭证 | `ctx.credentials` | `dsh-credentials` | `credentials-local` / `deepseek-account` | LLM 适配器、Web |
+| 后台作业 | `ctx.jobs` | `dsh-jobs` | `jobs-local` | `tool-jobs` |
 
 ## 5.8 一个 Seam 示例：文件系统
 
@@ -259,26 +270,36 @@ dsh 的每个可交换能力都是一个 **seam**，包含三个角色：
 
 ## 5.9 工具呈现 —— UI 渲染意图
 
-工具的 UI 呈现是**设计的一部分**，不是事后补丁。每个工具在定义时就声明它的呈现方式：
+工具的 UI 呈现是**设计的一部分**，不是事后补丁。每个工具在定义时就声明它的呈现方式。呈现词汇在 [packages/core/tools/src/presentation.ts](../../packages/core/tools/src/presentation.ts)：
 
-```ts
-interface ToolCallView {
-  kind: 'card'
-  variant: 'generic' | 'terminal' | 'diff' | 'search' | 'read' | 'web'
-  title?: string
-  locations?: FileLocation[]
-  diff?: FileDiff[]
-  // ...
-}
+```ts ignore-check
+// 调用视图：三种形态
+type ToolCallView = GenericCallView | TerminalCallView | DiffCallView
+
+// 结果视图：六种形态
+type ToolResultView =
+  | GenericResultView | TerminalResultView | DiffResultView
+  | SearchResultView  | ReadResultView     | WebResultView
+
+// 每种视图可带一个图标提示
+type ToolCallKind = 'read' | 'edit' | 'delete' | 'move' | 'search' | 'execute' | 'fetch' | 'other'
 ```
 
-**呈现方法是纯函数**——`presentCall(args)` 和 `presentResult(args, result)` 都是无副作用的纯函数，输入是参数/结果，输出是视图描述。UI 和日志重放共用同一份呈现逻辑。
+**呈现方法是纯函数**——`presentCall(args)` 和 `presentResult(args, result)` 都是无副作用的纯函数，输入是参数/结果，输出是视图描述。宿主侧 presenter 保持纯函数；Web 卡片从原始事件和持久化的 `meta`（`presentationMeta` / `tool/result.meta`）派生。
 
 这意味着：
 
 - 工具的 UI 卡片不需要额外的渲染插件——工具自带呈现。
-- 日志重放时，UI 卡片能从参数和结果精确重建——不需要存储渲染状态。
-- 不同的前端（Web、CLI）可以解释同一份视图描述，各自渲染。
+- 日志重放时，UI 卡片能从参数和持久化结果元数据精确重建——不需要存储渲染状态。
+- 不同的前端（Web、Desktop）可以解释同一份视图描述，各自渲染。
+
+## 5.10 PTC 模式 —— 工具即代码
+
+除了把工具 schema 直接发给模型（native 模式），dsh 还支持 **PTC（Programmatic Tool Calling）**：模型写一段程序，程序里的调用经 `run_code` 传输进入同一个工具注册表。
+
+- **`ctx.tools.presentAs()`** 由 agent preset 声明呈现模式：`'native' | 'ptc' | 'both'`（[packages/core/agent-tool-presentation](../../packages/core/agent-tool-presentation/src/index.ts)）。工具注册表本身留在 host 平面，呈现模式是每个组合的选择。
+- **PTC 运行时**（`ctx.ptcRuntime`，`ptc-runtime-node`）在沙箱里执行程序；程序对工具的每次子派发经 `tools/ptc-dispatch-log` waterfall 记录以便重建，但只有外层精选结果进入模型历史。
+- 工作流引擎（`ctx.workflowEngine`）的 provider `workflow-ptc` 也跑在这个运行时上。
 
 ## 深入追问
 
@@ -286,5 +307,6 @@ interface ToolCallView {
 - `concludesTurn` 和 `agent/turn-stopping` 有什么关系？（提示：数据驱动 vs 事件驱动，前者优先）
 - 如果一个工具的 `execute` 抛异常，管线如何处理？（提示：异常被捕获，归一为 `ToolExecutionFailure`）
 - 为什么工具参数用受限 JSON Schema 子集而不是完整 JSON Schema？（提示：验证一致性 + 模型兼容性）
+- PTC 子派发为什么逐个记录（`tools/ptc-dispatch-log`）却只把外层结果给模型？（提示：可重建性 vs 上下文成本）
 
 下一篇 → [06 · 持久化与启动组合](./06-persistence-and-boot.md)

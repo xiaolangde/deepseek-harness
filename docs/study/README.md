@@ -34,7 +34,7 @@
 | 03 | [会话日志与事件溯源](./03-session-log.md) | SessionEvent、deriveMessages、Surface 模型、turn/step | 3 |
 | 04 | [LLM 流式与 Provider 适配](./04-llm-streaming.md) | StreamChunk、ContentBlock、LlmAdapter、重试策略 | 4 |
 | 05 | [工具系统与能力 Seam](./05-tools-and-seams.md) | ToolDefinition、执行管线、Service Definition / Provider / Consumer | 5 |
-| 06 | [持久化与启动组合](./06-persistence-and-boot.md) | JSONL/SQLite 持久化、崩溃恢复、Profile / Bundle / Boot | 6 |
+| 06 | [持久化与启动组合](./06-persistence-and-boot.md) | JSONL 代际文件与格式迁移、崩溃恢复、Profile / Bundle / Boot | 6 |
 | 07 | [设计哲学提炼](./07-design-principles.md) | 抽象出可复用的设计原则 | 7 |
 | 08 | [未来追问清单](./08-further-questions.md) | 每个子系统留下的可深挖问题 | 翻阅 |
 
@@ -49,8 +49,8 @@ pnpm install
 # 2. 启动 headless 模式跑一个任务（需要 DEEPSEEK_API_KEY）
 pnpm dsh --profile headless "hello, explain what you are"
 
-# 3. 或者启动 web 界面
-pnpm dsh --profile web
+# 3. 或者启动 web 界面（先构建前端，再启动；编辑客户端插件会自动重建）
+pnpm run dev:web
 # → 浏览器打开后，创建会话、发消息、观察工具调用
 ```
 

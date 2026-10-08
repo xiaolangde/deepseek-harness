@@ -6,16 +6,15 @@
 
 ## 6.1 持久化 Seam
 
-`ctx.sessionPersistence`（`SessionPersistence`）是持久化的 Service Definition。它定义了 locate / create / append / prepare / load / inspect / readFrom / list / listSnapshots 等方法——全部基于 `SessionEvent`，没有平行的持久化事件类型。
+`ctx.sessionPersistence`（`SessionPersistence`）是持久化的 Service Definition。它是**句柄式** API：`create(header)` / `open(id, access)` 返回一个 `SessionHandle`，通过它 append / flush / read；另有 `stat(id)` 和 `list()` 做只读头信息观察（不加载事件流）。全部基于 `SessionEvent`，没有平行的持久化事件类型。
 
-两个可互换后端实现同一契约：
+当前唯一的后端实现：
 
 | 后端 | 存储 | 特点 |
 |---|---|---|
-| `dsh-session-persistence-jsonl` | 每会话一个 JSONL 文件 | 追加只逻辑日志；默认 Zstandard 压缩帧；崩溃安全原子写 |
-| `dsh-session-persistence-sqlite` | 共享 SQLite 库 | 每 `SessionEvent` 一行；单调 `SCHEMA_VERSION` pragma |
+| `dsh-session-persistence-jsonl` | 每会话一个目录，内含版本化代际文件 `session.vN.jsonl[.zstd]` | 追加只逻辑日志；默认 Zstandard 压缩帧；崩溃安全原子写；内核锁租约防止双写 |
 
-两者通过共享的 `runPersistenceContract` 套件验证——保证行为一致。
+后端契约由共享的 `runPersistenceContract` 套件验证（[packages/session/session-persistence/tests/contract.ts](../../packages/session/session-persistence/tests/contract.ts)）。非会话数据（设置、存储域等）走独立的 `storage/` 能力族（`storage-json` / `storage-sqlite`）。
 
 ## 6.2 flush 检查点机制
 
@@ -27,22 +26,22 @@ Session.append(event)
   ├── 同步：追加到内存日志
   │     └── session/event (emit, fire-and-forget) → UI/SDK
   │
-  └── 异步：持久化插件复制到 per-session 控制器
+  └── 异步：JSONL 插件深拷贝事件进 per-session 写缓冲
         │
-        ├── 首个待处理事件 → 启动固定批处理窗口
+        ├── 首个待处理事件 → 启动有界批处理窗口
         ├── 后续事件 → 加入当前批次（不重置截止）
-        └── 窗口过期 → 持久化批次 → session/flush
+        └── 窗口过期 → 经串行 mutation chain 持久化批次
 
-session/flush (awaited parallel)
-  └── 通知所有持久化插件"现在是安全检查点"
+session/flush (awaited)
+  └── 通知持久化插件"现在是安全检查点"
 ```
 
 **关键设计**：
 
-- **`session/event` 不阻塞生产者**——持久化插件把事件复制进控制器，然后异步写入。
-- **批处理窗口是固定的**——后续事件加入不重置截止时间，避免"永远在积压"。
-- **`session/flush` 是 awaited parallel**——调用方可以等待持久化完成（如关闭前检查点）。
-- **被拒的后台写保留事件并暂停自动重试**——不会丢数据，但需要外部干预。
+- **`session/event` 不阻塞生产者**——持久化插件把事件复制进缓冲，然后异步写入。
+- **批处理窗口是有界的**——后续事件加入不重置截止时间，避免"永远在积压"。
+- **turn 边界不等待 flush**——语义化的 durability 检查点（模型请求、顶层工具派发、step 完成）由 `dsh-session-checkpoint-policy` 决定何时 flush。
+- **失败的后台写保留事件并暂停自动重试**——不会丢数据；下一次 `session/flush` 大声重试。
 
 ## 6.3 崩溃恢复
 
@@ -53,68 +52,68 @@ session/flush (awaited parallel)
 1. 单个 turn 可能很大，截断会丢大量数据。
 2. 事件已经持久化了，它们是已发生的事实。
 
-**恢复策略**：用合成 `turn/end {reason:{kind:'interrupted'}}` 关闭孤儿 turn。
+**恢复策略**：用合成 `turn/end {reason:{kind:'interrupted'}}` 关闭孤儿 turn。修复工具（`interruptedTurnClosers`、`ToolCallRecovery`）由 `dsh-session` 提供，未封闭 interrupted 尾部的常规修复是**句柄消费者**（恢复路径）的职责；后端只负责在迁移已封印的历史日志时补上缺失的 interrupted 关闭。
 
 ```
 崩溃前的日志:
   seq 1: turn/start {turn: 5}
   seq 2: step/start {turn:5, step:1}
   seq 3: user/message
-  seq 4: assistant/chunk
+  seq 4: tool/call (没有 tool/result)
   ... (没有 turn/end)
 
 恢复后的日志:
-  seq 1: turn/start {turn: 5}
-  seq 2: step/start {turn:5, step:1}
-  seq 3: user/message
-  seq 4: assistant/chunk
-  seq 5: turn/end {turn:5, reason:{kind:'interrupted'}}  ← 合成
+  seq 1-4: 原样保留
+  seq 5: tool/result (TOOL_OUTCOME_UNKNOWN 之类的恢复结果)
+  seq 6: turn/end {turn:5, reason:{kind:'interrupted'}}  ← 合成
 ```
 
 **`interrupted` 是唯一非循环发出的 `TurnEndReason`**——它只在崩溃恢复时出现，不会在正常运行中产生。
 
 **恢复流程**：
 
-1. `inspect(id)`：构造不可变逻辑 Session，不发布不写——只用于检查日志状态。
-2. `prepare(id)`：预留 Session，提交待修复（合成 `interrupted` 事件），返回可处置发布句柄。
-3. 修复仅用于冷会话——活跃 id 的 `load` 等待内存快照持久且仅在平衡时返回。
+1. `stat(id)` / `list()`：只读头信息观察，选择每个会话目录的最高代际文件，不加载事件。
+2. `open(id, access)`：读打开在内存中解码/迁移，不发布后继代际；**写打开**先编码、校验，再把版本命名的后继代际文件独占发布在未改动的源文件旁边。
+3. `ctx.sessions.prepare()`：预留 Session 并提交修复，返回可处置的发布句柄。
 
-## 6.4 SessionHeader —— 与日志分离存储
+## 6.4 SessionHeader 与格式版本 —— 与日志分离存储
 
 `SessionHeader` 是会话的元数据头，与事件日志分离存储：
 
 ```ts
+import type { SessionId } from '@deepseek-ai/dsh-session'
+
 interface SessionHeader {
-  version: number            // 格式版本
+  version: 4                   // SESSION_FORMAT_VERSION
   id: SessionId
   createdAt: number
-  cwd: string                // 工作目录
-  parentSession?: SessionId  // 分叉来源
-  seedLength?: number        // 种子长度
-  origin: SessionOrigin      // 起源分类
-  delegationDepth?: number   // 委托深度
-  agentPreset?: string       // 使用的 preset
+  cwd?: string                 // 工作目录
+  parentSession?: SessionId    // 分叉来源
+  isSeeded: boolean            // fork 血缘标记（精确继承长度走存储元数据）
+  origin?: 'subagent'          // 起源分类
+  delegationDepth?: number     // 委托深度
+  agentPreset?: string         // 使用的 preset
 }
 ```
 
 **为什么分离**：
 
 - 头信息是会话级的元数据，不是事件——不需要 append-only。
-- 头信息需要频繁读（列表会话时），分离存储更高效。
-- `version` 不匹配时拒绝加载（不迁移）——`SESSION_FORMAT_VERSION` 在 `0`，无兼容承诺。
+- 头信息需要频繁读（列表会话时），分离存储更高效——`stat`/`list` 只解析头。
+
+**格式版本是发布契约**：`SESSION_FORMAT_VERSION` 当前是 `4`。读到**未来**版本直接拒绝；读到**历史**版本则通过相邻迁移链（`session-format-v0-to-v1` … `v3-to-v4`，每包恰好一步 `vN → vN+1`）解码为当前逻辑事件。已提交的代际文件永不移动、覆盖或删除——写路径把迁移结果发布为新的版本命名代际。版本化的格式历史见 [docs/persistence-changes/](../persistence-changes/README.md)。
 
 ## 6.5 Profile 与 Bundle —— 启动组合
 
 dsh 运行时不是一个"编译好的程序"，而是一个**从有序层组合出的插件树**。
 
 ```
-组合顺序（从下到上）:
+组合顺序（从下到上，应用在空条目列表上）:
   1. bundle 层（按 profile 声明的顺序）
-     ├── dsh-base         （核心：模型/工具/持久化/沙箱/审批）
-     ├── dsh-web-app      （web 界面层，如果是 web profile）
-     └── dsh-headless     （一次性任务层，如果是 headless profile）
+      ├── dsh-base         （核心：模型/工具/持久化/沙箱/审批）
+      └── dsh-web-app / dsh-headless / dsh-acp-app / dsh-sdk-app
   2. profile 的 cordis.patch.yml
-  3. home 级 cordis.patch.yml
+  3. home 级 cordis.patch.yml（机器本地偏好，高于 per-profile 层）
   4. --patch overlay（命令行传入）
 ```
 
@@ -123,7 +122,7 @@ dsh 运行时不是一个"编译好的程序"，而是一个**从有序层组合
 - `package.json`：树外插件 `dependencies` + `dsh.profile` manifest（有序 `bundles` 列表）。
 - `cordis.patch.yml`：用户自己的 patch 层。
 
-**Bundle**：manifest 声明 `"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }` 的 npm 包。它是 Cordis 配置行和它们挂载的代码的**分发格式**。
+**Bundle**：manifest 声明 `"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }` 的 npm 包。它是 Cordis 配置行和它们挂载的代码的**分发格式**。`dsh-web-app` 的 patch 是一个数组——除主 patch 外还带 standard / ptc / minimal / cordis 等 preset 层。
 
 **Patch**：一个 patch 目标一个 entry id，替换其整个 config，或插入新行。上层 patch 覆盖下层。
 
@@ -143,7 +142,7 @@ profile/cordis.patch.yml:
 
 ## 6.6 Boot 启动序列
 
-`boot()` 函数（`packages/boot/app-boot/src/index.ts`）是启动入口：
+`boot()` 函数（[packages/boot/app-boot/src/index.ts](../../packages/boot/app-boot/src/index.ts)）是启动入口：
 
 ```
 boot(binName, configPath, patches?, prepare?)
@@ -174,17 +173,20 @@ boot(binName, configPath, patches?, prepare?)
 
 **fail-loud 原则**：dsh 不静默跳过错误。Loader 失败时，在 stderr 标注具体行 + 退出码 1。这符合 dsh 的设计哲学：**misconfiguration fails loud**。
 
-## 6.7 三种运行模式
+## 6.7 运行模式
+
+只有 `dsh` profile 启动受支持的 Node 应用（`dsh <name>` 是 `dsh --profile <name>` 的简写）：
 
 | 模式 | 命令 | 特点 |
 |---|---|---|
-| **web** | `dsh --profile web` | 浏览器界面；HTTP 服务器；持久会话 |
-| **headless** | `dsh --profile headless "task"` | 一次性任务；无服务器；跑完即退出 |
-| **ACP** | `dsh --profile acp` | Agent Client Protocol 自动化服务器 |
+| **web** | `dsh web` | 浏览器界面；HTTP 服务器 + WebSocket；持久会话 |
+| **headless** | `dsh headless "task"` | 一次性任务；无服务器；跑完即退出 |
+| **acp** | `dsh acp` | Agent Client Protocol 自动化服务器 |
+| **sdk** | `dsh sdk` | SDK JSON-RPC 服务器（TypeScript / Python SDK 都选它） |
+| **sdk-minimal** | `dsh sdk-minimal` | 单 bundle 完整显式 SDK 树，不叠加 dsh-base |
+| **desktop** | （由 Electron 应用独占管理） | 桌面壳内启动 Host + 完整 Web 应用 |
 
-**web 模式**的插件树：`dsh-base` + `dsh-web-app`（HTTP 路由 + SPA + WebSocket）。
-
-**headless 模式**的插件树：`dsh-base` + `dsh-headless`（直接执行单个任务，不启动服务器）。
+**web 模式**的插件树：`dsh-base` + `dsh-web-app`。服务端由 `packages/host/`（webserver、controller 等）承载，浏览器端是一棵客户端插件树（`packages/client/` 的 `ui-*` 插件 + `apps/web` 前端壳）。
 
 **查看实际插件树**：
 
@@ -221,17 +223,17 @@ dsh --profile web --dump-config
 
 ## 6.9 Profile 模板与 HMR
 
-`web` 和 `headless` 是内置的 profile 模板——首次使用时自动初始化到 `$DSH_HOME/profiles/`。
+`acp`、`web`、`headless`、`sdk`、`sdk-minimal` 是内置的 profile 模板——`--from-default-profile` 首次初始化时把模板的 bundle 列表复制到 `$DSH_HOME/profiles/<name>/`，之后不再跟随模板变化。
 
-**HMR（热模块替换）**：`watchUserPatches` 监听用户 patch 文件变化，变化时重组用户 patch 层。这意味着你可以在运行中修改 `cordis.patch.yml`，插件树会自动更新——不需要重启。
-
-**注意**：HMR 只重组用户 patch 层，不重组 bundle 层。Bundle 层是启动时固定组合的。
+**HMR（热重载）**：`dsh-hmr` 插件（`ctx.hmr`）监听 profile patch 文件并串行化配置与插件模块重载。YAML 控制开关：base 为 web 启用 config-only HMR；headless、SDK、ACP 禁用；`sdk-minimal` 不含它。profile patch 可以覆盖这些默认。
 
 ## 深入追问
 
-- 为什么用 JSONL 而不是直接用 SQLite？（提示：可读性 + 调试 + 人类可检查）
-- `session/flush` 是 awaited parallel——如果某个持久化插件拒绝写怎么办？（提示：保留事件 + 暂停自动重试）
-- 为什么 `SESSION_FORMAT_VERSION` 在 `0`？（提示：pre-release，无兼容承诺，格式可自由变更）
-- `--dump-config` 输出的 entry 列表和实际挂载的插件树有什么关系？（提示：include 自己的解析器 + patch 算法离线组合）
+- 为什么写打开要把迁移结果发布为**新的代际文件**，而不是原地升级？（提示：已提交代际不可变 + 崩溃安全 + 旧版本可读性）
+- `session/flush` 是 awaited 的——如果持久化插件写入失败（如磁盘满），会发生什么？（提示：保留缓冲 + 暂停自动重试 + flush 大声拒绝）
+- 崩溃恢复时用合成 `interrupted` 关闭孤儿 turn——这个合成事件写入日志吗？它会影响 `seq` 编号吗？
+- Profile 模板首次使用时初始化——如果模板更新了，已初始化的 profile 会更新吗？（提示：只复制一次，无继承元数据）
+- profile 的 `node_modules` 拦截层如何参与模块解析？（提示：[packages/boot/app-boot/src/profile.ts](../../packages/boot/app-boot/src/profile.ts) 的 real-path 祖先链）
+- 为什么 `dsh-sdk-minimal` 故意不叠加 `dsh-base`？（提示：一个 bundle 拥有完整显式树）
 
 下一篇 → [07 · 设计哲学提炼](./07-design-principles.md)

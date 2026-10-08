@@ -15,7 +15,7 @@ DeepSeek Harness（简称 dsh）是一个**基于插件架构的 AI 编码 Agent
 
 ## 1.2 包布局概览
 
-仓库根 `packages/` 下有约 40 个包组、上百个包。初学只需要关注核心脊柱和几个关键能力族：
+仓库根 `packages/` 下有 50 多个包组、300 多个包，另有 `apps/` 应用壳（cli / web / desktop）。初学只需要关注核心脊柱和几个关键能力族：
 
 ```
 core/           —— 产品 API 脊柱（每个组合都会启动）
@@ -25,40 +25,42 @@ core/           —— 产品 API 脊柱（每个组合都会启动）
   tools/          工具注册表与执行管线（ctx.tools）
   agent/          Agent 接口与注册表（ctx.agents）
   agent-loop/     默认 agent 驱动器（ctx.agentLoop）
+  agent-tool-presentation/  preset 选择的工具呈现模式（native / PTC）
 
 llm/            —— LLM 能力族
-  llm/            流式词汇与适配器 seam（ctx.llm）
-  llm-deepseek/   DeepSeek 直连适配器
-  token-meter/    token 计量（ctx.tokenMeter）
+  llm/            消息模型、流式词汇与适配器 seam（ctx.llm）
+  llm-deepseek/   DeepSeek 直连适配器（account / api-key 凭据各自成包）
+  llm-pi-ai/      pi-ai 多 provider 适配器
+  llm-retry/      agent/request-error 重试策略
+  token-meter/    重放感知 token 计量（ctx.tokenMeter）
 
-fs/             —— 文件系统能力族
-  fs/             Service Definition（ctx.fs）
-  fs-local/       本地实现
-  fs-sandbox/     沙箱强制实现
-
-shell/          —— shell 能力族
-  shell/          执行器契约（ctx.shell）
-  bash-local/     本地 bash 执行
-
-subprocess/     —— 子进程能力族
-  subprocess/     Service Definition（ctx.subprocess）
-  subprocess-local/ 本地进程树
+fs/ shell/ subprocess/ sandbox/ —— 执行环境能力族
+  每族都是 Service Definition + 本地/沙箱 provider + 工具 Consumer
 
 session/        —— 持久会话数据平面
-  session-persistence/     持久化 seam（ctx.sessionPersistence）
-  session-persistence-jsonl/  JSONL 后端
-  session-persistence-sqlite/ SQLite 后端
+  session-persistence/      持久化 seam（ctx.sessionPersistence，句柄式 API）
+  session-persistence-jsonl/ JSONL 后端（版本化代际文件，默认 zstd 压缩）
+  session-format-v*-to-v*/  会话格式逐版本相邻迁移链
+  session-projection/       durable 折叠状态投影 seam（ctx.sessionProjections）
 
 boot/           —— 启动胶水
   app-boot/       profile/bundle 组合 + 启动序列
+  plugin-manager/ 插件安装管理（dsh plugin）
+  hmr/            配置与插件模块热重载
 
 bundle/         —— profile 插件层
   base/           每个 profile 首层（模型/工具/持久化/沙箱/审批）
-  web-app/        浏览器界面层
+  web-app/        浏览器界面层（含 standard/ptc/minimal 等 preset patch）
   headless/       一次性任务模式
+  acp-app/ sdk-app/ sdk-minimal/  自动化与 SDK 层
+
+apps/           —— 应用壳（不在 packages/ 下）
+  cli/            dsh 命令行启动器（profile / plugin / dump-config 模式）
+  web/            浏览器前端（Vite，客户端插件树）
+  desktop/        Electron 桌面应用（独占 desktop profile）
 ```
 
-其余像 `lsp/`、`skill/`、`compaction/`、`subagent/`、`web/`、`sandbox/`、`terminal/`、`jobs/`、`workflow/`、`sdk/`、`acp/`、`hooks/`、`interaction/` 等是能力族或集成层，初学可以略过，需要时再查 [packages/README.md](../../packages/README.md)。
+其余像 `lsp/`、`skill/`、`compaction/`、`subagent/`、`web/`、`terminal/`、`jobs/`、`workflow/`、`ptc-runtime/`、`mcp/`、`webhook/`、`goal/`、`schedule/`、`ssh/`、`storage/`、`attachment/`、`session-query/`、`extensions/`（运行时自我修改）、`host/`（Web 服务端）、`client/`（浏览器 UI 插件）、`sdk/`、`acp/`、`hooks/`、`interaction/` 等是能力族或集成层，初学可以略过，需要时再查 [packages/README.md](../../packages/README.md)。
 
 ## 1.3 依赖方向（核心约束）
 
@@ -150,6 +152,7 @@ dsh 的每个能力 seam 都包含三个角色，**缺一不可**：
 | 工具注册表 | [packages/core/tools/src/index.ts](../../packages/core/tools/src/index.ts) |
 | 工具定义 DSL | [packages/core/tools/src/schema.ts](../../packages/core/tools/src/schema.ts) |
 | 系统提示组装 | [packages/core/system-prompt/src/index.ts](../../packages/core/system-prompt/src/index.ts) |
+| 消息模型（Message / ContentBlock） | [packages/llm/llm/src/message.ts](../../packages/llm/llm/src/message.ts) |
 | LLM 流式类型 | [packages/llm/llm/src/types.ts](../../packages/llm/llm/src/types.ts) |
 | LLM 适配器注册 | [packages/llm/llm/src/index.ts](../../packages/llm/llm/src/index.ts) |
 | 持久化 seam | [packages/session/session-persistence/src/index.ts](../../packages/session/session-persistence/src/index.ts) |
@@ -171,7 +174,7 @@ dsh 最颠覆性的设计是**没有特权核心**：
 
 ## 深入追问
 
-- 为什么 `agent-loop` 是 `bundle` 角色而不是 `core` 角色？（提示：它是唯一具体实现，可替换）
+- 工具注册表为什么留在 host 平面，而工具呈现模式（native / PTC）由 agent preset 通过 `ctx.tools.presentAs()` 选择？（提示：注册表被循环、代理与所有工具插件共享；呈现是每个组合的选择，见 [packages/core/agent-tool-presentation/src/index.ts](../../packages/core/agent-tool-presentation/src/index.ts)）
 - 如果两个 provider 注册了同一个 `ctx.fs`，会发生什么？（提示：scope 隔离 + first-wins）
 - `dsh-agent` 和 `dsh-agent-loop` 的分界未来会如何演化？
 
